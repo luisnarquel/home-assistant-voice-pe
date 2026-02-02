@@ -201,14 +201,12 @@ switch:
             binary_sensor.is_off: hardware_mute_switch
           then:
             - microphone.mute:
-      - voice_assistant.stop:
     turn_off_action:
       - if:
           condition:
             binary_sensor.is_off: hardware_mute_switch
           then:
             - microphone.unmute:
-      - voice_assistant.start_continuous:
     on_turn_on:
       - script.execute: control_leds
     on_turn_off:
@@ -1488,18 +1486,6 @@ script:
                 then:
                   - micro_wake_word.disable_model: stop
 
-  # Script to handle the end of the streaming wake word voice assistant.
-  # Should we restart it? Shall we keep it stopped?
-  - id: handle_voice_assistant_end
-    then:
-      - if:
-          condition:
-              switch.is_off: master_mute_switch
-          then:
-            - voice_assistant.start_continuous:
-          else:
-            - voice_assistant.stop:
-
 i2s_audio:
   - id: i2s_output
     # i2s_output data pin is gpio10
@@ -1733,6 +1719,12 @@ micro_wake_word:
     gain_factor: 4
   stop_after_detection: false
   models:
+    - model: https://github.com/kahrendt/microWakeWord/releases/download/okay_nabu_20241226.3/okay_nabu.json
+      id: okay_nabu
+    - model: hey_jarvis
+      id: hey_jarvis
+    - model: hey_mycroft
+      id: hey_mycroft
     - model: https://github.com/kahrendt/microWakeWord/releases/download/stop/stop.json
       id: stop
       internal: true
@@ -1766,6 +1758,19 @@ micro_wake_word:
                             - media_player.stop:
                                 announcement: true
                                 id: external_media_player
+                          # Start the voice assistant and play the wake sound, if enabled
+                          else:
+                            - if:
+                                condition:
+                                  switch.is_on: wake_sound
+                                then:
+                                  - script.execute:
+                                      id: play_sound
+                                      priority: true
+                                      sound_file: "wake_word_triggered_sound"
+                                  - delay: 300ms
+                            - voice_assistant.start:
+                                wake_word: !lambda return wake_word;
 
 select:
   - platform: template
@@ -1804,13 +1809,14 @@ voice_assistant:
     microphone: i2s_mics
     channels: 0
   media_player: external_media_player
-  use_wake_word: true
+  micro_wake_word: mww
+  use_wake_word: false
   noise_suppression_level: 0
   auto_gain: 0 dbfs
   volume_multiplier: 1
   on_client_connected:
     - lambda: id(init_in_progress) = false;
-    - voice_assistant.start_continuous:
+    - micro_wake_word.start:
     - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
     - script.execute: control_leds
   on_client_disconnected:
@@ -1825,11 +1831,9 @@ voice_assistant:
           and:
             - lambda: return !id(init_in_progress);
             - lambda: return code != "duplicate_wake_up_detected";
+            - lambda: return code != "stt-no-text-recognized";
         then:
           - lambda: id(voice_assistant_phase) = ${voice_assist_error_phase_id};
-          - script.execute: control_leds
-          - delay: 1s
-          - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
           - script.execute: control_leds
     # If the error code is cloud-auth-failed, serve a local audio file guiding the user.
     - if:
@@ -1840,20 +1844,13 @@ voice_assistant:
               id: play_sound
               priority: true
               sound_file: "error_cloud_expired"
-  on_listening:
-    - if:
-        condition:
-          switch.is_on: wake_sound
-        then:
-          - script.execute:
-              id: play_sound
-              priority: true
-              sound_file: !lambda return id(wake_word_triggered_sound);
   # When the voice assistant starts: Play a wake up sound, duck audio.
+  on_start:
     - mixer_speaker.apply_ducking:
         id: media_mixing_input
         decibel_reduction: 20  # Number of dB quieter; higher implies more quiet, 0 implies full volume
         duration: 0.0s         # The duration of the transition (default is no transition)
+  on_listening:
     - lambda: id(voice_assistant_phase) = ${voice_assist_waiting_for_command_phase_id};
     - script.execute: control_leds
   on_stt_vad_start:
@@ -1882,15 +1879,6 @@ voice_assistant:
           - script.execute: control_leds
           # Start a script that would potentially enable the stop word if the response is longer than a second
           - script.execute: activate_stop_word_once
-          - wait_until:
-              lambda: |-
-                return id(external_media_player)->state == media_player::MediaPlayerState::MEDIA_PLAYER_STATE_ANNOUNCING;
-          - wait_until:
-              not:
-                lambda: |-
-                  return id(external_media_player)->state == media_player::MediaPlayerState::MEDIA_PLAYER_STATE_ANNOUNCING;
-          - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
-          - script.execute: control_leds
   # When the voice assistant ends ...
   on_end:
     - wait_until:
@@ -1910,7 +1898,6 @@ voice_assistant:
     # Reset the voice assistant phase id and reset the LED animations.
     - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
     - script.execute: control_leds
-    - script.execute: handle_voice_assistant_end
   on_timer_finished:
     - switch.turn_on: timer_ringing
   on_timer_started:
