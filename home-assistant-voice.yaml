@@ -46,6 +46,14 @@ esphome:
       - script.execute: control_leds
       - delay: 1s
       - switch.turn_on: internal_speaker_amp
+      - wait_until: wifi.connected
+      - wait_until: api.connected
+      - if:
+          condition:
+            lambda: return id(voice_assistant_enabled_state);
+          then:
+            - voice_assistant.start:
+                silence_detection: true
       # If after 10 minutes, the device is still initializing (It did not yet connect to Home Assistant), turn off the init_in_progress variable and run the script to refresh the LED status
       - delay: 10min
       - if:
@@ -179,6 +187,20 @@ globals:
     type: bool
     restore_value: no
     initial_value: 'false'
+  # Global variable storing the configured wake word engine name
+  - id: wake_word_engine
+    type: std::string
+    restore_value: true
+    initial_value: '"openWakeWord"'
+  # Global variable tracking the voice assistant enabled state
+  - id: voice_assistant_enabled_state
+    type: bool
+    restore_value: true
+    initial_value: 'true'
+  # Global variable tracking if voice assistant session was just started
+  - id: assist_just_started
+    type: bool
+    initial_value: 'false'
 
 switch:
   # This is the master mute switch. It is exposed to Home Assistant. The user can only turn it on and off if the hardware switch is off. (The hardware switch overrides the software one)
@@ -219,6 +241,21 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
+  # Voice Assistant Enabled Switch.
+  - platform: template
+    id: voice_assistant_enabled
+    name: Voice Assistant Enabled
+    icon: mdi:ear-hearing
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    turn_on_action:
+      - lambda: id(voice_assistant_enabled_state) = true;
+      - voice_assistant.start:
+          silence_detection: true
+    turn_off_action:
+      - lambda: id(voice_assistant_enabled_state) = false;
+      - voice_assistant.stop
   # Internal switch to track when a timer is ringing on the device.
   - platform: template
     id: timer_ringing
@@ -307,41 +344,42 @@ binary_sensor:
                     then:
                       - switch.turn_off: timer_ringing
                     else:
-                      - if:
-                          condition:
-                            voice_assistant.is_running:
-                          then:
-                            - voice_assistant.stop:
-                          else:
-                            - if:
-                                condition:
-                                  media_player.is_announcing:
-                                    id: external_media_player
-                                then:
-                                  media_player.stop:
-                                    announcement: true
-                                    id: external_media_player
-                                else:
-                                  - if:
-                                      condition:
-                                        media_player.is_playing:
-                                          id: external_media_player
-                                      then:
-                                        - media_player.pause:
-                                            id: external_media_player
-                                      else:
-                                        - if:
-                                            condition:
-                                              and:
-                                                - switch.is_off: master_mute_switch
-                                                - not: voice_assistant.is_running
-                                            then:
-                                              - script.execute:
-                                                  id: play_sound
-                                                  priority: true
-                                                  sound_file: "center_button_press_sound"
-                                              - delay: 300ms
-                                              - voice_assistant.start:
+                       - if:
+                           condition:
+                             voice_assistant.is_running:
+                           then:
+                             - voice_assistant.stop:
+                           else:
+                             - if:
+                                 condition:
+                                   media_player.is_announcing:
+                                     id: external_media_player
+                                 then:
+                                   - media_player.stop:
+                                       announcement: true
+                                       id: external_media_player
+                                 else:
+                                   - if:
+                                       condition:
+                                         media_player.is_playing:
+                                           id: external_media_player
+                                       then:
+                                         - media_player.pause:
+                                             id: external_media_player
+                                       else:
+                                         - if:
+                                             condition:
+                                               and:
+                                                 - switch.is_off: master_mute_switch
+                                                 - not: voice_assistant.is_running
+                                                 - lambda: return id(voice_assistant_enabled_state);
+                                             then:
+                                               - script.execute:
+                                                   id: play_sound
+                                                   priority: true
+                                                   sound_file: "center_button_press_sound"
+                                               - delay: 300ms
+                                               - voice_assistant.start:
       # Double Click
       #  . Exposed as an event entity. To be used in automations inside Home Assistant
       - timing:
@@ -1066,6 +1104,8 @@ script:
             id(control_leds_voice_assistant_error_phase).execute();
           } else if (id(voice_assistant_phase) == ${voice_assist_not_ready_phase_id}) {
             id(control_leds_voice_assistant_not_ready_phase).execute();
+          } else if (id(voice_assistant_enabled_state) == false) {
+            id(control_leds_voice_assistant_disabled).execute();
           } else if (id(is_timer_active)) {
             id(control_leds_timer_ticking).execute();
           } else if (id(master_mute_switch).state) {
@@ -1212,6 +1252,17 @@ script:
           red: 1
           green: 0
           blue: 0
+          id: voice_assistant_leds
+          effect: "Twinkle"
+
+  # Script executed when the voice assistant is disabled
+  - id: control_leds_voice_assistant_disabled
+    then:
+      - light.turn_on:
+          brightness: 0.33
+          red: 0.5
+          green: 0.5
+          blue: 0.5
           id: voice_assistant_leds
           effect: "Twinkle"
 
@@ -1810,7 +1861,7 @@ voice_assistant:
     channels: 0
   media_player: external_media_player
   micro_wake_word: mww
-  use_wake_word: false
+  use_wake_word: true
   noise_suppression_level: 0
   auto_gain: 0 dbfs
   volume_multiplier: 1
@@ -1821,6 +1872,7 @@ voice_assistant:
     - script.execute: control_leds
   on_client_disconnected:
     - voice_assistant.stop:
+    - micro_wake_word.stop:
     - lambda: id(voice_assistant_phase) = ${voice_assist_not_ready_phase_id};
     - script.execute: control_leds
   on_error:
@@ -1898,6 +1950,15 @@ voice_assistant:
     # Reset the voice assistant phase id and reset the LED animations.
     - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
     - script.execute: control_leds
+  on_wake_word_detected:
+    - if:
+        condition:
+          switch.is_on: wake_sound
+        then:
+          - script.execute:
+              id: play_sound
+              priority: false
+              sound_file: "wake_word_triggered_sound"
   on_timer_finished:
     - switch.turn_on: timer_ringing
   on_timer_started:
